@@ -1,0 +1,157 @@
+# Copyright (c) 2026 Microsoft Corporation. All rights reserved.
+# SPDX-License-Identifier: MIT
+name: CodeQL Security Analysis
+
+on:
+  schedule:
+    # Weekly scan: Sundays at 4 AM UTC
+    - cron: '0 4 * * 0'
+  workflow_call:
+
+permissions:
+  contents: read
+
+# Pull request runs analyze the whole tree, as push and scheduled runs do.
+# Diff-informed analysis would report only results on changed lines, so the
+# gate's exact exception counts would differ between pull requests and main.
+env:
+  CODEQL_ACTION_DIFF_INFORMED_QUERIES: 'false'
+
+concurrency:
+  group: codeql-analysis-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-slide-bundles:
+    name: Verify Slide Bundle Sources
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+
+      - name: Restore slide build dependencies
+        env:
+          SEARCH_ROOT: slides
+        run: ./scripts/ci/install-skill-node-deps.sh
+
+      - name: Verify generated slide bundles against source
+        run: npm run slides:check
+
+  analyze:
+    name: CodeQL Analysis
+    needs: verify-slide-bundles
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write  # Required for SARIF upload to Security tab
+      actions: read # codeql-action reads workflow run metadata
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        # Repository contains GitHub Actions workflows, Python, and JavaScript/TypeScript (VS Code extension source)
+        # CodeQL 'actions' scans workflows, 'python' scans scripts, and 'javascript-typescript' covers both JS and TS
+        # PowerShell and shell scripts are not CodeQL-supported (covered by PSScriptAnalyzer and shellcheck)
+        language: [ 'actions', 'python', 'javascript-typescript' ]
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended,security-and-quality
+          config-file: ./.github/codeql/config.yml
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          category: "/language:${{ matrix.language }}"
+          output: ${{ runner.temp }}/codeql-sarif
+
+      # Results are uploaded above first, so alerts appear even when the gate fails.
+      - name: Setup PowerShell modules
+        uses: $/.github/actions/setup-ps-modules
+
+      - name: Enforce CodeQL threshold gate
+        shell: pwsh
+        run: ./scripts/security/Test-CodeQLSarifThreshold.ps1 -SarifPath (Join-Path $env:RUNNER_TEMP 'codeql-sarif')
+
+      - name: Add job summary
+        if: always()
+        env:
+          MATRIX_LANGUAGE: ${{ matrix.language }}
+        run: |
+          {
+            echo "## CodeQL Security Analysis Complete"
+            echo "**Language:** ${MATRIX_LANGUAGE}"
+            echo "**Queries:** security-extended, security-and-quality"
+            echo ""
+            echo "📊 View results in the Security tab under Code Scanning"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  analyze-generated-slides:
+    name: CodeQL Analysis (generated slides)
+    needs: verify-slide-bundles
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write  # Required for SARIF upload to Security tab
+      actions: read # codeql-action reads workflow run metadata
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Delivered single-file decks inline third-party reveal.js, so they use a
+      # separate category that keeps generated findings out of the authored-source baseline.
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: javascript-typescript
+          build-mode: none
+          queries: security-extended,security-and-quality
+          config-file: ./.github/codeql/generated-slides.yml
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          category: "/language:javascript-typescript/generated-slides"
+          output: ${{ runner.temp }}/codeql-sarif
+
+      # Results are uploaded above first, so alerts appear even when the gate fails.
+      - name: Setup PowerShell modules
+        uses: $/.github/actions/setup-ps-modules
+
+      - name: Enforce CodeQL threshold gate
+        shell: pwsh
+        run: ./scripts/security/Test-CodeQLSarifThreshold.ps1 -SarifPath (Join-Path $env:RUNNER_TEMP 'codeql-sarif')
+
+      - name: Add job summary
+        if: always()
+        run: |
+          {
+            echo "## CodeQL Security Analysis Complete"
+            echo "**Scope:** generated slide decks (docs/slides/*.html)"
+            echo "**Queries:** security-extended, security-and-quality"
+            echo ""
+            echo "📊 View results in the Security tab under Code Scanning"
+          } >> "$GITHUB_STEP_SUMMARY"
